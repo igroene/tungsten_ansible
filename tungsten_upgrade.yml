@@ -1,0 +1,118 @@
+- hosts: all
+  become: yes
+  any_errors_fatal: yes
+  tasks:
+  
+    - name: verify cluster is healthy
+      shell: "/opt/continuent/tungsten/cluster-home/bin/tungsten_monitor"
+      run_once: true
+
+    - name: Disable bridge mode for connector
+      become: yes
+      lineinfile:
+        path: /etc/tungsten/tungsten.ini
+        line: connector-bridge-mode=false
+        insertafter: EOF
+
+    - name: Disable the check for modified files
+      become: yes
+      lineinfile:
+        path: /etc/tungsten/tungsten.ini
+        line: skip-validation-check=ModifiedConfigurationFilesCheck
+        insertafter: '^skip-validation-check'
+
+    - name: Capture Master Node
+      become: yes
+      shell: "su - tungsten -c \"echo 'ls' | cctrl \" | grep -B 5 'REPLICATOR(role=master, state=ONLINE)' | grep progress | cut -d'(' -f1 | sed 's/|//'"
+      changed_when: False
+      run_once: true
+      register: master_node_result
+
+    - set_fact:
+        master_node: "{{ master_node_result.stdout }}"
+
+    - name: Replace current master in tungsten.ini file
+      become: yes
+      lineinfile:
+        path: /etc/tungsten/tungsten.ini
+        regexp: '^master='
+        line: 'master={{ master_node_result.stdout }}'
+
+    - name: Downtime alerts
+      shell: "/usr/local/bin/downtime --host='{{ ansible_hostname }} --service='{{ item }}' --comment='Downtime services for Tungsten Upgrade'"
+      with_items: [ 'Tungsten policy mode', 'Tungsten Replicator Status', 'Tungsten THL Retention' ]
+      run_once: true
+      delegate_to: nagios_host.example.com
+
+    - name: Set Policy to Maintenance
+      become: yes
+      shell: "su - tungsten -c \"echo 'set policy maintenance' | cctrl\""
+      run_once: true
+      register: maintenance_results
+
+    - debug: var=maintenance_results.stdout_lines
+
+    - name: copy Tungsten packages
+      copy:
+        src: /vagrant/tungsten
+        dest: /tmp
+
+- hosts: all
+  become: yes
+  any_errors_fatal: yes
+  serial: 1 
+  tasks:
+
+    - name: Start the rolling upgrade on slave nodes
+      block:
+        - name: Install Continuent Tungsten rpm
+          yum:
+            name: 
+              - /tmp/tungsten/tungsten-clustering-5.3.5-623.x86_64.rpm
+            state: present
+
+      when: ansible_fqdn != master_node
+
+- hosts: all
+  become: yes
+  any_errors_fatal: yes
+  tasks:
+    - name: Upgrade the master
+      block:
+      - name: Install Continuent Tungsten rpm
+        yum:
+          name: 
+            - /tmp/tungsten/tungsten-clustering-5.3.5-623.x86_64.rpm
+          state: present
+
+      - name: Online cluster replicator on master
+        shell: "su - tungsten -c \"trepctl online\""
+
+      when: ansible_fqdn == master_node   
+     
+- hosts: all
+  become: yes
+  gather_facts: false
+  any_errors_fatal: yes
+  tasks:     
+
+    - name: Set Policy to automatic
+      become: yes
+      shell: "su - tungsten -c \"echo 'set policy automatic' | /opt/continuent/tungsten/tungsten-manager/bin/cctrl\""
+      register: maintenance_results
+
+    - debug: var=maintenance_results.stdout_lines
+
+    - name: Check cluster status
+      shell: "su - tungsten -c \"echo ls | cctrl\""
+      register: maintenance_results
+      run_once: true 
+
+    - debug: var=maintenance_results.stdout_lines
+      run_once: true
+
+    - name: Cancel downtime alerts
+      shell: "/usr/local/bin/downtime --cancel --host='{{ ansible_hostname }} --service='{{ item }}' --comment='Downtime services for Tungsten Upgrade'"
+      with_items: [ 'Tungsten policy mode', 'Tungsten Replicator Status', 'Tungsten THL Retention' ]
+      run_once: true
+      delegate_to: nagios_host.example.com
